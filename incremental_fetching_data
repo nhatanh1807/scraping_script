@@ -1,0 +1,97 @@
+from delta.tables import DeltaTable
+from pyspark.sql.functions import (
+    col, to_date, dayofmonth, month, hour, to_timestamp, from_utc_timestamp
+)
+from datetime import datetime, timedeltaa
+import requests
+import pytz
+
+tz = pytz.timezone("Asia/Bangkok")
+today = datetime.now(tz).date()
+yesterday = today - timedelta(days=1)
+tomorrow = today + timedelta(days=1)
+
+cities = spark.table("workspace.default.dim_city").collect()
+weather_data = []
+
+def fetch_weather_data(base_url, params, city, lat, lng):
+    response = requests.get(base_url, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        if "hourly" in data:
+            for t, temp, rh, pr in zip(
+                data["hourly"]["time"],
+                data["hourly"]["temperature_2m"],
+                data["hourly"]["relative_humidity_2m"],
+                data["hourly"]["precipitation"]
+            ):
+                weather_data.append({
+                    "city": city,
+                    "lat": lat,
+                    "lng": lng,
+                    "datetime": t,
+                    "temperature": temp,
+                    "humidity": rh,
+                    "precipitation": pr,
+                    "type": "hourly"
+                })
+
+for row in cities: 
+    city = row["city"]
+    lat = row["lat"]
+    lng = row["lng"]
+
+    archive_url = "https://archive-api.open-meteo.com/v1/archive"
+    archive_params = {
+        "latitude": lat,
+        "longitude": lng,
+        "start_date": yesterday.isoformat(),
+        "end_date": today.isoformat(),
+        "hourly": "temperature_2m,relative_humidity_2m,precipitation",
+        "timezone": "Asia/Bangkok"
+    }
+    fetch_weather_data(archive_url, archive_params, city, lat, lng)
+
+    forecast_url = "https://api.open-meteo.com/v1/forecast"
+    forecast_params = {
+        "latitude": lat,
+        "longitude": lng,
+        "start_date": today.isoformat(),
+        "end_date": tomorrow.isoformat(),
+        "hourly": "temperature_2m,relative_humidity_2m,precipitation",
+        "timezone": "Asia/Bangkok"
+    }
+    fetch_weather_data(forecast_url, forecast_params, city, lat, lng)
+
+if weather_data:
+    weather_sdf = spark.createDataFrame(weather_data)
+    weather_sdf = weather_sdf.dropDuplicates(["city", "datetime"])
+
+    weather_sdf = (
+        weather_sdf
+        .withColumn("datetime", to_timestamp(col("datetime")))
+        .withColumn("local_datetime", from_utc_timestamp(col("datetime"), "Asia/Bangkok"))
+        .withColumn("date", to_date(col("local_datetime")))
+        .withColumn("hour", hour(col("local_datetime")))
+        .withColumn("day", dayofmonth(col("local_datetime")))
+        .withColumn("month", month(col("local_datetime")))
+        .drop("local_datetime")
+    )
+
+    dt = DeltaTable.forName(spark, "workspace.default.weather_vn")
+    delete_dates = [yesterday.isoformat(), today.isoformat(), tomorrow.isoformat()]
+    dt.delete(f"date in ({','.join([f'\"{d}\"' for d in delete_dates])})")
+
+    (
+        weather_sdf
+        .write
+        .format("delta")
+        .mode("append")
+        .partitionBy("date")
+        .saveAsTable("workspace.default.weather_vn")
+    )
+
+    print(f"Loaded {len(weather_data)} records into weather_vn for {yesterday} → {tomorrow}")
+
+else:
+    print("No weather data fetched from APIs.")
