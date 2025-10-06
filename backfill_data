@@ -1,0 +1,91 @@
+from pyspark.sql.functions import (
+    col, to_date, dayofmonth, month, hour, to_timestamp
+)
+import requests
+from datetime import datetime
+from delta.tables import DeltaTable
+
+dbutils.widgets.text("start_date", "2024-01-01", "Start Date")
+dbutils.widgets.text("end_date", "2025-10-03", "End Date")
+
+start_date = dbutils.widgets.get("start_date")
+end_date = dbutils.widgets.get("end_date")
+
+print(f"Fetching weather data from {start_date} to {end_date}")
+
+cities = spark.table("default.dim_city").collect()
+weather_data = []
+
+for row in cities:
+    city = row["city"]
+    lat = row["lat"]
+    lng = row["lng"]
+
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": lat,
+        "longitude": lng,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": "temperature_2m,relative_humidity_2m,precipitation",
+        "timezone": "Asia/Bangkok"
+    }
+
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        if "hourly" in data:
+            for t, temp, rh, pr in zip(
+                data["hourly"]["time"],
+                data["hourly"]["temperature_2m"],
+                data["hourly"]["relative_humidity_2m"],
+                data["hourly"]["precipitation"]
+            ):
+                weather_data.append({
+                    "city": city,
+                    "lat": lat,
+                    "lng": lng,
+                    "datetime": t,
+                    "temperature": temp,
+                    "humidity": rh,
+                    "precipitation": pr,
+                    "type": "hourly"
+                })
+
+if weather_data:
+    weather_sdf = spark.createDataFrame(weather_data)
+
+    weather_sdf = (
+        weather_sdf
+        .withColumn("datetime", to_timestamp(col("datetime")))
+        .withColumn("date", to_date(col("datetime")))
+        .withColumn("hour", hour(col("datetime")))
+        .withColumn("day", dayofmonth(col("datetime")))
+        .withColumn("month", month(col("datetime")))
+        .dropDuplicates(["city", "datetime"])
+    )
+
+    table_name = "weather_vn"
+
+    if spark.catalog.tableExists(f"default.{table_name}"):
+        deltaTable = DeltaTable.forName(spark, f"default.{table_name}")
+        (
+            deltaTable.alias("t")
+            .merge(
+                weather_sdf.alias("s"),
+                "t.city = s.city AND t.datetime = s.datetime"
+            )
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+    else:
+        (
+            weather_sdf
+            .write
+            .format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .partitionBy("date")
+            .saveAsTable(table_name)
+        )
